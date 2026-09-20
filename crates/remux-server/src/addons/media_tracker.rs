@@ -73,6 +73,13 @@ impl MediaTrackerError {
             }
         )
     }
+
+    pub fn retry_delay(&self) -> Option<Duration> {
+        match self {
+            Self::Retryable { retry_after, .. } => *retry_after,
+            Self::Permanent { .. } => None,
+        }
+    }
 }
 
 impl std::fmt::Display for MediaTrackerError {
@@ -132,16 +139,19 @@ pub enum MediaTrackerEventKind {
 pub enum MediaTrackerEvent {
     PlaybackStart {
         position_ticks: i64,
+        session_id: String,
     },
     PlaybackProgress {
         position_ticks: i64,
         is_paused: bool,
+        session_id: String,
     },
     PlaybackStop {
         position_ticks: i64,
         /// Passed the watched threshold. Providers scrobble a finish
         /// differently from an abandon.
         played: bool,
+        session_id: String,
     },
     MarkPlayed,
     MarkUnplayed,
@@ -170,7 +180,7 @@ impl MediaTrackerEvent {
 
     pub fn position_ticks(&self) -> Option<i64> {
         match self {
-            Self::PlaybackStart { position_ticks }
+            Self::PlaybackStart { position_ticks, .. }
             | Self::PlaybackProgress { position_ticks, .. }
             | Self::PlaybackStop { position_ticks, .. } => Some(*position_ticks),
             Self::MarkPlayed
@@ -195,6 +205,9 @@ pub struct MediaTrackerTarget {
     pub series: Option<Box<MediaTrackerTarget>>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    /// Runtime in Jellyfin ticks (100ns), used to turn playback positions into
+    /// the percentage expected by scrobble providers.
+    pub runtime_ticks: Option<i64>,
 }
 
 /// Whether any id here is one a media tracker could key on. `ExternalIds`
@@ -229,6 +242,15 @@ impl MediaTrackerTarget {
 /// Opaque to core: a static webhook token and an OAuth triple look the same.
 pub type MediaTrackerCredentials = remux_utils::Secret<serde_json::Value>;
 
+/// The secret and the small amount of non-secret identity safe to show in an
+/// administrator connection list.
+#[derive(Debug, Clone)]
+pub struct MediaTrackerConnection {
+    pub credentials: MediaTrackerCredentials,
+    pub remote_account_id: Option<String>,
+    pub remote_account_name: Option<String>,
+}
+
 /// Drives which connect UI the dashboard renders, without it knowing the
 /// provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,9 +278,14 @@ pub struct DeviceAuthStart {
 #[derive(Debug, Clone)]
 pub enum DeviceAuthPoll {
     Pending,
-    Approved(MediaTrackerCredentials),
-    /// Declined or expired. Start over.
+    /// The provider accepted the attempt but asked the client to reduce its
+    /// polling frequency.
+    SlowDown,
+    Approved(MediaTrackerConnection),
+    /// The account owner explicitly declined the request.
     Denied,
+    /// The device code timed out. Start over with a new code.
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -294,7 +321,7 @@ pub struct MediaTrackerCapabilities {
     /// Must be a subset of `supported_events`.
     pub default_event_filter: Vec<MediaTrackerEventKind>,
     pub history_import: bool,
-    /// Partial playback positions, carried on `RemoteWatch::position_ticks` by
+    /// Partial playback positions, carried on `RemoteWatch::progress` by
     /// `import_history` and `pull_changes` rather than by a method of its own.
     pub progress_import: bool,
     pub watch_state_sync: SyncDirection,
@@ -344,13 +371,27 @@ pub trait MediaTrackerAddon: AddonKind + Send + Sync {
     /// Must be cheap and do no I/O — called while rendering pages.
     fn capabilities(&self) -> MediaTrackerCapabilities;
 
+    /// Whether the server-level application credentials needed to connect an
+    /// account are present. Providers with no operator configuration keep the
+    /// default.
+    fn configured(&self) -> bool {
+        true
+    }
+
+    /// Optional tag used by core to expose imported history as a smart
+    /// catalog. Providers opt in because not every tracker returns enough
+    /// title and identity data to materialize missing media safely.
+    fn history_catalog_tag(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Should hit the provider so a bad token is rejected while the user is
     /// still on the form, not later as a failed scrobble.
     async fn connect_with_token(
         &self,
         _fields: &serde_json::Value,
         _ctx: &MediaTrackerCtx,
-    ) -> MediaTrackerResult<MediaTrackerCredentials> {
+    ) -> MediaTrackerResult<MediaTrackerConnection> {
         Err(MediaTrackerError::unsupported("token authentication"))
     }
 
@@ -374,7 +415,7 @@ pub trait MediaTrackerAddon: AddonKind + Send + Sync {
         _code: &str,
         _redirect_uri: &str,
         _ctx: &MediaTrackerCtx,
-    ) -> MediaTrackerResult<MediaTrackerCredentials> {
+    ) -> MediaTrackerResult<MediaTrackerConnection> {
         Err(MediaTrackerError::unsupported("redirect authentication"))
     }
 
@@ -455,19 +496,32 @@ pub trait MediaTrackerAddon: AddonKind + Send + Sync {
 /// `pull_changes`.
 #[derive(Debug, Clone)]
 pub struct RemoteWatch {
+    /// Top-level movie or show title. Providers include this alongside IDs and
+    /// core can use it to materialize a metadata stub when the item is not yet
+    /// present in the local catalog.
+    pub title: String,
+    pub year: Option<i32>,
     pub ids: db::ExternalIds,
     pub season: Option<i64>,
     pub episode: Option<i64>,
     pub watched: bool,
+    pub play_count: Option<i64>,
     /// Present only when the provider reports partial progress.
-    pub position_ticks: Option<i64>,
+    pub progress: Option<RemoteProgress>,
     pub watched_at: Option<chrono::NaiveDateTime>,
+    pub progress_at: Option<chrono::NaiveDateTime>,
     /// `None` when the provider does not report favourites. Without this a
     /// provider could declare `favorites: Pull` that core had no way to act on.
     pub favorite: Option<bool>,
     /// The remote 0-10 rating, `None` when the provider does not report one.
     /// Same reasoning as `favorite`: `ratings: Pull` needs somewhere to land.
     pub rating: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RemoteProgress {
+    Ticks(i64),
+    Percent(f32),
 }
 
 #[cfg(test)]
@@ -550,13 +604,17 @@ mod tests {
     fn every_event_reports_its_own_kind() {
         let cases = [
             (
-                MediaTrackerEvent::PlaybackStart { position_ticks: 0 },
+                MediaTrackerEvent::PlaybackStart {
+                    position_ticks: 0,
+                    session_id: "s".into(),
+                },
                 MediaTrackerEventKind::PlaybackStart,
             ),
             (
                 MediaTrackerEvent::PlaybackProgress {
                     position_ticks: 1,
                     is_paused: true,
+                    session_id: "s".into(),
                 },
                 MediaTrackerEventKind::PlaybackProgress,
             ),
@@ -564,6 +622,7 @@ mod tests {
                 MediaTrackerEvent::PlaybackStop {
                     position_ticks: 2,
                     played: true,
+                    session_id: "s".into(),
                 },
                 MediaTrackerEventKind::PlaybackStop,
             ),
@@ -603,6 +662,7 @@ mod tests {
             MediaTrackerEvent::PlaybackStop {
                 position_ticks: 99,
                 played: false,
+                session_id: "s".into(),
             }
             .position_ticks(),
             Some(99)
@@ -625,6 +685,7 @@ mod tests {
             series: None,
             season: None,
             episode: None,
+            runtime_ticks: None,
         }
     }
 
@@ -718,6 +779,8 @@ mod tests {
     #[test]
     fn remote_user_data_can_carry_a_favourite_on_its_own() {
         let watch = RemoteWatch {
+            title: "The Matrix".into(),
+            year: Some(1999),
             ids: db::ExternalIds {
                 tmdb: Some(603),
                 ..Default::default()
@@ -725,8 +788,10 @@ mod tests {
             season: None,
             episode: None,
             watched: false,
-            position_ticks: None,
+            play_count: None,
+            progress: None,
             watched_at: None,
+            progress_at: None,
             favorite: Some(true),
             rating: None,
         };
@@ -739,6 +804,8 @@ mod tests {
     #[test]
     fn remote_user_data_can_carry_a_rating_on_its_own() {
         let watch = RemoteWatch {
+            title: "The Matrix".into(),
+            year: Some(1999),
             ids: db::ExternalIds {
                 tmdb: Some(603),
                 ..Default::default()
@@ -746,8 +813,10 @@ mod tests {
             season: None,
             episode: None,
             watched: false,
-            position_ticks: None,
+            play_count: None,
+            progress: None,
             watched_at: None,
+            progress_at: None,
             favorite: None,
             rating: Some(7.0),
         };

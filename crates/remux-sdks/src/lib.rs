@@ -5,8 +5,12 @@ pub mod introdb;
 pub mod kitsu;
 pub mod remux;
 pub mod remuxdb;
+#[cfg(feature = "native")]
+pub mod simkl;
 pub mod stremio;
 pub mod tmdb;
+#[cfg(feature = "native")]
+pub mod trakt;
 
 mod rate_limit;
 

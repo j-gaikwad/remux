@@ -11,10 +11,12 @@ pub mod lrclib;
 pub mod media_tracker;
 pub mod opendal;
 pub mod probe;
+pub mod simkl;
 pub mod squid;
 pub mod stremio;
 pub mod tmdb;
 pub mod torznab;
+pub mod trakt;
 pub mod ytdlp;
 
 use anyhow::{Result, anyhow};

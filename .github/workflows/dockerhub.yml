@@ -1,9 +1,6 @@
 name: Docker Hub
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
@@ -11,23 +8,12 @@ on:
 permissions:
   contents: read
 
-jobs:
-  validate:
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-    name: Validate release image
-    uses: ./.github/workflows/build.yml
-    with:
-      version: pr-${{ github.event.pull_request.number }}
-      docker_tags: -t docker.io/jgaikwad/remux:pr-${{ github.event.pull_request.number }}
-      registry_image: docker.io/jgaikwad/remux
-      registry: docker.io
-      registry_username: jgaikwad
-      push: false
-      desktop: false
-      ref: ${{ github.event.pull_request.head.sha }}
+concurrency:
+  group: dockerhub-main
+  cancel-in-progress: true
 
+jobs:
   deploy:
-    if: github.event_name != 'pull_request'
     name: Publish release image
     uses: ./.github/workflows/build.yml
     with:
@@ -38,7 +24,6 @@ jobs:
       registry_image: docker.io/jgaikwad/remux
       registry: docker.io
       registry_username: jgaikwad
-      push: true
       desktop: false
       ref: ${{ github.sha }}
     # Configure DOCKERHUB_TOKEN as a repository Actions secret. Use a

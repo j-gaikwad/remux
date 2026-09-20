@@ -10,7 +10,7 @@ on:
       docker_tags:
         description: >-
           Space-separated imagetools tag flags,
-          e.g. "-t ghcr.io/lostb1t/remux:1.2.3 -t ghcr.io/lostb1t/remux:latest"
+          e.g. "-t docker.io/jgaikwad/remux:1.2.3 -t docker.io/jgaikwad/remux:latest"
         type: string
         required: true
       cargo_version:
@@ -28,8 +28,7 @@ on:
         default: ""
       desktop:
         description: >-
-          Build the desktop bundles (Linux/macOS/Windows). Set to false for
-          PR docker-only builds.
+          Build the desktop bundles (Linux/macOS/Windows).
         type: boolean
         required: false
         default: true
@@ -37,27 +36,20 @@ on:
         description: Fully qualified container image name
         type: string
         required: false
-        default: ghcr.io/lostb1t/remux
+        default: docker.io/jgaikwad/remux
       registry:
         description: Container registry hostname used for authentication
         type: string
         required: false
-        default: ghcr.io
+        default: docker.io
       registry_username:
         description: Container registry username
         type: string
         required: false
-        default: lostb1t
-      push:
-        description: Push images and publish the multi-platform manifest
-        type: boolean
-        required: false
-        default: true
+        default: jgaikwad
     secrets:
-      GH_TOKEN:
-        required: false
       registry_password:
-        required: false
+        required: true
 
 env:
   REGISTRY_IMAGE: ${{ inputs.registry_image }}
@@ -212,7 +204,7 @@ jobs:
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
-        run: echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> $GITHUB_ENV
+        run: echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         with:
@@ -359,7 +351,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          APP=$(ls -d target/${{ matrix.target }}/release/bundle/osx/*.app | head -1)
+          shopt -s nullglob
+          apps=(target/${{ matrix.target }}/release/bundle/osx/*.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "Expected exactly one macOS application bundle, found ${#apps[@]}" >&2
+            exit 1
+          fi
+          APP="${apps[0]}"
           codesign --deep --force --sign - "$APP"
           df -h /
           # The dashboard and jellyfin-web are already embedded in the binary at
@@ -461,9 +459,6 @@ jobs:
     name: Build Docker (${{ matrix.platform }})
     needs: [build-dashboard, build-server, build-jellyfin-web]
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -477,8 +472,8 @@ jobs:
     steps:
       - name: Prepare
         run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         with:
@@ -510,16 +505,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to container registry
-        if: inputs.push
         uses: docker/login-action@v3
         with:
           registry: ${{ inputs.registry }}
           username: ${{ inputs.registry_username }}
-          password: ${{ secrets.registry_password || secrets.GH_TOKEN }}
+          password: ${{ secrets.registry_password }}
 
       - name: Build and push by digest
-        if: inputs.push
-        id: build-push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -529,31 +522,11 @@ jobs:
           cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=build-${{ env.PLATFORM_PAIR }}
 
-      - name: Build PR validation image
-        if: inputs.push == false
-        id: build-local
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: ${{ matrix.platform }}
-          load: true
-          tags: remux-pr:${{ matrix.arch }}
-          cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=build-${{ env.PLATFORM_PAIR }}
-
       - name: Smoke test image
-        env:
-          PUSH_IMAGE: ${{ inputs.push }}
-          PUSH_DIGEST: ${{ steps.build-push.outputs.digest }}
         run: |
           set -euo pipefail
           name="remux-smoke-${{ matrix.arch }}"
-          if [ "$PUSH_IMAGE" = "true" ]; then
-            image="${REGISTRY_IMAGE}@${PUSH_DIGEST}"
-          else
-            image="remux-pr:${{ matrix.arch }}"
-          fi
+          image="${REGISTRY_IMAGE}@${{ steps.build.outputs.digest }}"
           trap 'docker logs "$name" 2>/dev/null || true; docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           docker run --detach --name "$name" --tmpfs /data "$image"
           for _ in $(seq 1 60); do
@@ -568,14 +541,12 @@ jobs:
           exit 1
 
       - name: Export digest
-        if: inputs.push
         run: |
           mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build-push.outputs.digest }}"
+          digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: inputs.push
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
@@ -587,15 +558,11 @@ jobs:
     name: Merge Docker manifests
     needs: [build-docker, build-desktop, smoke-test-windows]
     if: |
-      inputs.push &&
       always() &&
       needs.build-docker.result == 'success' &&
       (needs.build-desktop.result == 'success' || needs.build-desktop.result == 'skipped') &&
       (needs.smoke-test-windows.result == 'success' || needs.smoke-test-windows.result == 'skipped')
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -609,14 +576,21 @@ jobs:
         with:
           registry: ${{ inputs.registry }}
           username: ${{ inputs.registry_username }}
-          password: ${{ secrets.registry_password || secrets.GH_TOKEN }}
+          password: ${{ secrets.registry_password }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
+        env:
+          DOCKER_TAGS: ${{ inputs.docker_tags }}
         run: |
-          docker buildx imagetools create ${{ inputs.docker_tags }} \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+          set -euo pipefail
+          read -r -a tags <<< "$DOCKER_TAGS"
+          images=()
+          for digest in *; do
+            images+=("${REGISTRY_IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${tags[@]}" "${images[@]}"
 

@@ -2,9 +2,19 @@ name: Lint
 
 on:
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   fmt:
+    if: github.event.pull_request.draft == false
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
